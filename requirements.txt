@@ -1,0 +1,4 @@
+requests>=2.32
+httpx[http2]>=0.28
+curl_cffi>=0.14
+playwright>=1.58
