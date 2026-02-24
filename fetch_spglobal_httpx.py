@@ -1,77 +1,81 @@
 #!/usr/bin/env python3
-"""Fetch S&P Global index data with httpx HTTP/2."""
+"""Fetch S&P Global index data using Playwright Firefox."""
 
-import httpx
-from typing import Any
+import json
 
-
-HEADERS = {
-    "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10.15; rv:147.0) Gecko/20100101 Firefox/147.0",
-    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-    "Accept-Language": "en-CA,en-US;q=0.9,en;q=0.8",
-    "Accept-Encoding": "gzip, deflate, br, zstd",
-    "DNT": "1",
-    "Connection": "keep-alive",
-    "Upgrade-Insecure-Requests": "1",
-    "Sec-Fetch-Dest": "document",
-    "Sec-Fetch-Mode": "navigate",
-    "Sec-Fetch-Site": "none",
-    "Sec-Fetch-User": "?1",
-    "Sec-GPC": "1",
-}
+from playwright.sync_api import sync_playwright
 
 
 def fetch_index_data(
     index_id: str,
     period: str = "tenYearFlag",
     language_id: str = "1",
-) -> dict[str, Any]:
-    """Fetch index comparison data using HTTP/2."""
-    base_url = "https://www.spglobal.com"
+) -> dict:
+    """Fetch index data using Playwright Firefox to bypass Akamai bot protection."""
+    api_url = (
+        "https://www.spglobal.com/spdji/en/util/redesign/get-index-comparison-data.dot"
+        f"?compareArray={index_id}&periodFlag={period}&language_id={language_id}"
+    )
 
-    with httpx.Client(http2=True, headers=HEADERS, follow_redirects=True) as client:
-        # Visit main page first to get cookies
-        print("Visiting main page...")
-        resp = client.get(f"{base_url}/spdji/en/")
-        print(f"Main page status: {resp.status_code}")
-        print(f"Cookies: {list(client.cookies.keys())}")
+    with sync_playwright() as p:
+        browser = p.firefox.launch(headless=False)
+        page = browser.new_page()
 
-        # Fetch API
-        print("\nFetching API...")
-        api_url = f"{base_url}/spdji/en/util/redesign/get-index-comparison-data.dot"
-        params = {
-            "compareArray": index_id,
-            "periodFlag": period,
-            "language_id": language_id,
-        }
-        headers = {
-            "Sec-Fetch-Site": "same-origin",
-            "Referer": f"{base_url}/spdji/en/",
-        }
+        # Capture API response
+        result = {}
 
-        resp = client.get(api_url, params=params, headers=headers)
-        print(f"API status: {resp.status_code}")
+        def on_response(response):
+            if "get-index-comparison-data" in response.url:
+                try:
+                    result["data"] = response.json()
+                    result["status"] = response.status
+                    print(f"  [intercepted] status: {response.status}")
+                except Exception as e:
+                    result["error"] = str(e)
 
-        resp.raise_for_status()
-        return resp.json()
+        page.on("response", on_response)
+
+        try:
+            print("Navigating to API URL...")
+            page.goto(api_url, timeout=60000, wait_until="domcontentloaded")
+
+            print("Waiting for JS challenge...")
+            page.wait_for_timeout(10000)
+
+            print(f"  URL: {page.url}")
+            print(f"  Title: {page.title()}")
+
+            if "data" not in result:
+                body = page.inner_text("body")
+                try:
+                    result["data"] = json.loads(body)
+                except json.JSONDecodeError:
+                    result["data"] = {"error": True, "body": body[:1000]}
+        except Exception as e:
+            print(f"  Error: {e}")
+            result.setdefault("data", {"error": True, "message": str(e)})
+        finally:
+            browser.close()
+
+    return result.get("data", {"error": True, "message": "no response"})
 
 
 def main():
     index_id = "5457755"  # S&P/TSX Composite Index
 
-    print(f"Fetching index data for ID: {index_id}\n")
+    print(f"Fetching index data for ID: {index_id}")
+    print(f"{'='*60}\n")
+
     data = fetch_index_data(index_id)
 
-    print(f"\nStatus: {data.get('status')}")
-    print(f"Messages: {data.get('serviceMessages')}")
-
-    if data.get("status"):
-        perf = data["performanceComparisonHolder"]["indexPerformanceForComparison"][0]
-        print(f"\nIndex: {perf['indexName']}")
-        print(f"Index Value: {perf['indexValue']:.2f}")
-        print(f"Daily Return: {perf['dailyReturn']:.4f}%")
-        print(f"YTD Return: {perf['yearToDateReturn']:.4f}%")
-        print(f"1Y Return: {perf['oneYearReturn']:.4f}%")
+    print(f"\n{'='*60}")
+    if data.get("error"):
+        print("FAILED")
+        print(json.dumps(data, indent=2, default=str))
+    else:
+        print("FULL JSON RESPONSE")
+        print(f"{'='*60}")
+        print(json.dumps(data, indent=2))
 
 
 if __name__ == "__main__":

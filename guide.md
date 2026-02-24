@@ -35,12 +35,16 @@ Check cookies after visiting the main page:
 Try these approaches in order (simplest to most complex):
 
 ```
-Level 1: Add browser headers        → Works for basic protection
-Level 2: Use session with cookies   → Works for session-based checks
-Level 3: HTTP/2 with httpx          → Works for protocol fingerprinting
-Level 4: curl_cffi / TLS spoofing   → Works for TLS fingerprinting
-Level 5: Browser automation         → Works for JavaScript challenges
+Level 1: Add browser headers             → Works for basic protection
+Level 2: Use session with cookies        → Works for session-based checks
+Level 3: HTTP/2 with httpx               → Works for protocol fingerprinting
+Level 4: curl_cffi / TLS spoofing        → Works for TLS fingerprinting
+Level 5: Playwright Firefox (headless)   → Works for Akamai JS challenges  ✅
+Level 6: Playwright Chromium / Selenium  → Last resort (often detected)
 ```
+
+> **For S&P Global (Akamai Bot Manager), only Level 5 (Playwright Firefox) works reliably.**
+> Levels 1-4 and Playwright Chromium are all detected and blocked.
 
 ## Level 1: Browser Headers
 
@@ -153,34 +157,87 @@ Supported impersonation targets:
 - `safari15_5`, `safari17_0`
 - `edge101`
 
-## Level 5: Browser Automation
+## Level 5: Playwright Firefox (This Solution)
 
-For JavaScript challenges (Cloudflare turnstile, etc.), use real browser:
+For Akamai Bot Manager with JS challenges, **Playwright Firefox** is the only
+programmatic approach that works reliably. Chromium-based browsers (including
+Chrome, Playwright Chromium, and headless Chrome) are detected and blocked.
+
+### Why Firefox?
+
+| Browser Engine | Akamai Detection | Result |
+|---------------|------------------|--------|
+| Playwright Chromium | Detected (webdriver flag, TLS fingerprint) | 403 |
+| Playwright Chrome (system) | Detected (automation signals) | 403 |
+| Playwright Firefox | Not detected | **200** |
+| curl_cffi (Chrome impersonation) | Detected (no JS execution) | 403 |
+| httpx HTTP/2 | Inconsistent (works initially, then blocked) | 403 |
 
 ### Installation
 
 ```bash
 pip install playwright
-playwright install chromium
+playwright install firefox
 ```
 
 ### Implementation
 
 ```python
+import json
+from playwright.sync_api import sync_playwright
+
+def fetch_index_data(index_id, period="tenYearFlag", language_id="1"):
+    api_url = (
+        "https://www.spglobal.com/spdji/en/util/redesign/get-index-comparison-data.dot"
+        f"?compareArray={index_id}&periodFlag={period}&language_id={language_id}"
+    )
+
+    with sync_playwright() as p:
+        browser = p.firefox.launch(headless=False)
+        page = browser.new_page()
+
+        # Intercept network response
+        result = {}
+
+        def on_response(response):
+            if "get-index-comparison-data" in response.url:
+                result["data"] = response.json()
+
+        page.on("response", on_response)
+
+        page.goto(api_url, timeout=60000, wait_until="domcontentloaded")
+        page.wait_for_timeout(10000)  # Wait for JS challenge to resolve
+
+        browser.close()
+
+    return result.get("data", {})
+```
+
+### Key Techniques
+
+1. **Response interception** — Use `page.on("response", ...)` to capture API JSON
+   directly from the network layer, avoiding HTML parsing issues.
+2. **Wait for JS challenge** — Akamai injects a `<script>` tag that must execute
+   before the real response is returned. A 10-second timeout allows this.
+3. **Firefox engine** — Firefox's TLS fingerprint and automation signals differ
+   from Chromium, making it harder for Akamai to detect.
+
+## Level 6: Chromium / Selenium (Unreliable)
+
+Chromium-based automation is widely detected by Akamai. Even with stealth
+measures (`--disable-blink-features=AutomationControlled`, removing
+`navigator.webdriver`), Akamai still blocks the request.
+
+```python
+# This does NOT work for Akamai-protected sites
 from playwright.sync_api import sync_playwright
 
 with sync_playwright() as p:
     browser = p.chromium.launch(headless=True)
     page = browser.new_page()
-
-    # Navigate and wait for JS execution
     page.goto("https://example.com/")
     page.wait_for_load_state("networkidle")
-
-    # Extract data
     content = page.content()
-    # or intercept API responses
-
     browser.close()
 ```
 
@@ -213,15 +270,21 @@ print(f"HTTP Version: {response.http_version}")  # Should be "HTTP/2"
 
 ## Summary
 
-For S&P Global specifically:
+For S&P Global (Akamai Bot Manager):
 
-| Approach | Result |
-|----------|--------|
-| `requests` + headers | 403 Forbidden |
-| `requests.Session()` + cookies | 403 Forbidden |
-| `httpx` + HTTP/2 | **Success** |
+| Approach | Result | Why |
+|----------|--------|-----|
+| `requests` + headers | 403 | No HTTP/2, no JS execution |
+| `requests.Session()` + cookies | 403 | Same — HTTP/1.1 detected |
+| `httpx` + HTTP/2 | 403 (intermittent) | Works initially, then TLS fingerprinted |
+| `curl_cffi` (Chrome impersonation) | 403 | No JS execution for challenge |
+| Playwright Chromium | 403 | Automation detected |
+| Playwright Chrome (system) | 403 | Automation detected |
+| **Playwright Firefox** | **200** | **Passes all checks** |
 
-The site uses **Akamai Bot Manager** which fingerprints HTTP protocol version. Using `httpx` with HTTP/2 bypasses this check.
+The site uses **Akamai Bot Manager** which combines multiple detection layers:
+TLS fingerprinting, HTTP protocol checks, automation flags, and JS challenges.
+Only **Playwright Firefox** passes all layers reliably.
 
 ## References
 
